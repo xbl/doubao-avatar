@@ -1,6 +1,8 @@
 import { getDialogConfig, getDoubaoTtsConfig } from '@/config/env'
 import {
   EVENT_ASR_INFO,
+  EVENT_ASR_ENDED,
+  EVENT_ASR_RESPONSE,
   EVENT_CHAT_RESPONSE,
   EVENT_CONNECTION_STARTED,
   EVENT_FINISH_CONNECTION,
@@ -28,11 +30,47 @@ export type RealtimeHandlers = {
   onChatText?: (text: string) => void
 }
 
+export function extractAsrText(payload: ParsedFrame['payload']): string {
+  if (typeof payload === 'string') return payload
+  if (payload && typeof payload === 'object' && 'text' in payload) {
+    const text = (payload as { text?: unknown }).text
+    if (typeof text === 'string') return text
+  }
+  if (payload && typeof payload === 'object') {
+    for (const value of Object.values(payload)) {
+      if (!value || typeof value !== 'object') continue
+      const text = extractAsrText(value as ParsedFrame['payload'])
+      if (text) return text
+    }
+  }
+  return ''
+}
+
+export class AsrTranscriptBuffer {
+  private text = ''
+
+  update(payload: ParsedFrame['payload']): void {
+    const text = extractAsrText(payload)
+    if (text) this.text = text
+  }
+
+  commit(): string {
+    const text = this.text
+    this.text = ''
+    return text
+  }
+
+  reset(): void {
+    this.text = ''
+  }
+}
+
 export class DoubaoRealtimeClient {
   private ws: WebSocket | null = null
   private sessionId = crypto.randomUUID().replace(/-/g, '')
   private handlers: RealtimeHandlers = {}
   private closed = false
+  private asrTranscript = new AsrTranscriptBuffer()
   private pendingEventWaiters = new Map<number, Array<(frame: ParsedFrame) => void>>()
 
   async connect(handlers: RealtimeHandlers = {}): Promise<void> {
@@ -144,8 +182,20 @@ export class DoubaoRealtimeClient {
         )
         return
       }
-      if (frame.event === EVENT_ASR_INFO) {
-        this.handlers.onInterrupt?.()
+      if (
+        frame.event === EVENT_ASR_INFO ||
+        frame.event === EVENT_ASR_RESPONSE ||
+        frame.event === EVENT_ASR_ENDED
+      ) {
+        if (frame.event === EVENT_ASR_INFO) {
+          this.asrTranscript.reset()
+          this.handlers.onInterrupt?.()
+        } else if (frame.event === EVENT_ASR_RESPONSE) {
+          this.asrTranscript.update(frame.payload)
+        } else {
+          const text = this.asrTranscript.commit()
+          if (text) console.info('[doubao] user:', text)
+        }
         return
       }
       if (frame.event === EVENT_TTS_SENTENCE_START) {
