@@ -1,8 +1,9 @@
 import { getDialogConfig, getDoubaoTtsConfig } from '@/config/env'
 import {
-  EVENT_ASR_INFO,
   EVENT_ASR_ENDED,
+  EVENT_ASR_INFO,
   EVENT_ASR_RESPONSE,
+  EVENT_CHAT_RAG_TEXT,
   EVENT_CHAT_RESPONSE,
   EVENT_CONNECTION_STARTED,
   EVENT_FINISH_CONNECTION,
@@ -22,9 +23,11 @@ import { buildStartSessionPayload } from './sessionConfig'
 
 export type RealtimeHandlers = {
   onPcm?: (pcm: Uint8Array) => void
-  onTtsStart?: () => void
+  onTtsStart?: (info?: { ttsType?: string; text?: string }) => void
   onTtsEnd?: () => void
   onInterrupt?: () => void
+  /** Fired on ASREnded with best available transcript for this turn. */
+  onAsrEnded?: (text: string, turnId: number) => void
   onError?: (err: Error) => void
   onStatus?: (msg: string) => void
   onChatText?: (text: string) => void
@@ -72,12 +75,14 @@ export class DoubaoRealtimeClient {
   private closed = false
   private asrTranscript = new AsrTranscriptBuffer()
   private pendingEventWaiters = new Map<number, Array<(frame: ParsedFrame) => void>>()
+  private turnId = 0
 
   async connect(handlers: RealtimeHandlers = {}): Promise<void> {
     this.handlers = handlers
     this.closed = false
     this.sessionId = crypto.randomUUID().replace(/-/g, '')
     this.pendingEventWaiters.clear()
+    this.asrTranscript.reset()
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const url = `${proto}://${location.host}/doubao-realtime`
@@ -182,24 +187,32 @@ export class DoubaoRealtimeClient {
         )
         return
       }
-      if (
-        frame.event === EVENT_ASR_INFO ||
-        frame.event === EVENT_ASR_RESPONSE ||
-        frame.event === EVENT_ASR_ENDED
-      ) {
-        if (frame.event === EVENT_ASR_INFO) {
-          this.asrTranscript.reset()
-          this.handlers.onInterrupt?.()
-        } else if (frame.event === EVENT_ASR_RESPONSE) {
-          this.asrTranscript.update(frame.payload)
-        } else {
-          const text = this.asrTranscript.commit()
-          if (text) console.info('[doubao] user:', text)
-        }
+      if (frame.event === EVENT_ASR_INFO) {
+        this.asrTranscript.reset()
+        this.turnId += 1
+        this.handlers.onInterrupt?.()
+        return
+      }
+      if (frame.event === EVENT_ASR_RESPONSE) {
+        this.asrTranscript.update(frame.payload)
+        return
+      }
+      if (frame.event === EVENT_ASR_ENDED) {
+        const text = this.asrTranscript.commit().trim()
+        const turnId = this.turnId
+        if (text) console.info('[doubao] user:', text)
+        this.handlers.onAsrEnded?.(text, turnId)
         return
       }
       if (frame.event === EVENT_TTS_SENTENCE_START) {
-        this.handlers.onTtsStart?.()
+        const payload =
+          frame.payload && typeof frame.payload === 'object'
+            ? (frame.payload as { tts_type?: unknown; text?: unknown })
+            : null
+        const ttsType = typeof payload?.tts_type === 'string' ? payload.tts_type : undefined
+        const text = typeof payload?.text === 'string' ? payload.text : undefined
+        if (ttsType) console.info('[doubao] tts_type=', ttsType)
+        this.handlers.onTtsStart?.({ ttsType, text })
         return
       }
       if (frame.event === EVENT_TTS_ENDED) {
@@ -232,6 +245,22 @@ export class DoubaoRealtimeClient {
     this.send(buildAudioTaskRequest(this.sessionId, pcm16k))
   }
 
+  /** Send ChatRAGText (502). `externalRag` must already be a JSON array string. */
+  sendChatRagText(externalRag: string, turnId?: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    if (!externalRag.trim()) return
+    console.info(
+      `[doubao] ChatRAGText items≈chars=${externalRag.length} turn=${turnId ?? this.turnId}`,
+    )
+    this.send(
+      buildFullClientEvent(
+        EVENT_CHAT_RAG_TEXT,
+        { external_rag: externalRag },
+        this.sessionId,
+      ),
+    )
+  }
+
   private send(buf: Uint8Array): void {
     this.ws?.send(buf)
   }
@@ -239,6 +268,7 @@ export class DoubaoRealtimeClient {
   async close(): Promise<void> {
     this.closed = true
     this.pendingEventWaiters.clear()
+    this.asrTranscript.reset()
     const ws = this.ws
     this.ws = null
     if (!ws) return

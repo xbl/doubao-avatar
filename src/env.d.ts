@@ -19,6 +19,11 @@ interface ImportMetaEnv {
   readonly VITE_IFLYTEK_SCENE_ID: string
   readonly VITE_IFLYTEK_AVATAR_ID: string
   readonly VITE_IFLYTEK_VCN: string
+  /** External RAG (local HSK vocab). Default on when unset. */
+  readonly VITE_RAG_ENABLED: string
+  readonly VITE_RAG_BASE_URL: string
+  readonly VITE_RAG_TOP_K: string
+  readonly VITE_RAG_TIMEOUT_MS: string
 }
 
 interface ImportMeta {

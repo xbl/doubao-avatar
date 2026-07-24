@@ -2,6 +2,7 @@ import { FrameQueue } from '@/modules/audio/frameQueue'
 import { MicCapture } from '@/modules/audio/micCapture'
 import { DoubaoRealtimeClient } from '@/modules/doubao/realtimeClient'
 import { IflytekAvatar } from '@/modules/iflytek/avatar'
+import { retrieveForQuery } from '@/modules/rag/ragClient'
 
 export type TalkState = 'idle' | 'starting' | 'talking' | 'stopping' | 'error'
 
@@ -24,6 +25,8 @@ export class TalkSession {
   private audioPipeline: Promise<void> = Promise.resolve()
   private wrapper: HTMLElement | null = null
   private cb: TalkSessionCallbacks = {}
+  private ragAbort: AbortController | null = null
+  private activeRagTurnId = 0
 
   constructor(callbacks: TalkSessionCallbacks = {}) {
     this.cb = callbacks
@@ -59,7 +62,11 @@ export class TalkSession {
           this.enqueueAvatarOperation(() => this.onTtsEnd())
         },
         onInterrupt: () => {
+          this.abortRagRetrieve()
           this.enqueueAvatarOperation(() => this.onInterrupt())
+        },
+        onAsrEnded: (text, turnId) => {
+          void this.onAsrEnded(text, turnId)
         },
         onError: (err) => {
           this.cb.onError?.(err.message)
@@ -75,6 +82,34 @@ export class TalkSession {
       await this.cleanup()
       this.setState('error')
       this.cb.onError?.(msg)
+    }
+  }
+
+  private abortRagRetrieve() {
+    this.ragAbort?.abort()
+    this.ragAbort = null
+  }
+
+  private async onAsrEnded(text: string, turnId: number) {
+    if (this.state !== 'talking') return
+    this.abortRagRetrieve()
+    const controller = new AbortController()
+    this.ragAbort = controller
+    this.activeRagTurnId = turnId
+
+    try {
+      const result = await retrieveForQuery(text, { signal: controller.signal })
+      if (controller.signal.aborted) return
+      if (this.state !== 'talking') return
+      if (turnId !== this.activeRagTurnId) return
+      if (!result?.externalRag) return
+
+      this.doubao.sendChatRagText(result.externalRag, turnId)
+    } catch (e) {
+      // retrieveForQuery already swallows network errors; keep session alive.
+      console.warn('[rag] unexpected error', e)
+    } finally {
+      if (this.ragAbort === controller) this.ragAbort = null
     }
   }
 
@@ -125,6 +160,7 @@ export class TalkSession {
   }
 
   private async cleanup() {
+    this.abortRagRetrieve()
     this.queue.clear()
     this.mic.stop()
     // Stop avatar first so leftover Doubao PCM cannot writeAudio after teardown.
