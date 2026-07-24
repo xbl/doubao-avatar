@@ -24,6 +24,7 @@
 - 首版不做「要不要 RAG」的二次 LLM 判断（用检索分数 + 条数规则）
 - 不部署远端 RAG（本机 8787 + 已有 CORS）
 - 首版不加 Vite `/rag` 代理（浏览器直连即可）
+- 首版不经 MCP 接入知识库；不指望豆包实时会话原生调 MCP Server
 
 ## 3. Product intent（对齐共识）
 
@@ -212,6 +213,55 @@ function toCard(hit: RagHit): { title: string; content: string } {
 3. protocol 502 + realtimeClient ASR 回调与 `sendChatRagText`  
 4. `talkSession` 编排 + env  
 5. 手动验收  
+
+## 17. RAG vs MCP（边界与可选路径）
+
+`ragClient` 与 MCP **没有直接关系**；二者常一起出现在 AI 讨论里，但职责不同。
+
+| | 本项目的 `ragClient` / 外部 RAG | MCP（Model Context Protocol） |
+|--|--------------------------------|------------------------------|
+| 是什么 | 客户端先检索本机词库，再经豆包 **502 ChatRAGText** 注入材料 | 给 Agent/工具用的标准协议：模型侧按规范调用外部 Server（搜文档、读库、调 API 等） |
+| 通信对象 | HTTP `8787/retrieve` + 豆包实时语音 WS | MCP Client ↔ MCP Server（如 Cursor 里的各类 Server） |
+| 本 POC | **已采用** | **未采用** |
+
+### 豆包实时 API 能否「通过 MCP 去查」？
+
+按官方 [端到端实时语音 · 外部 RAG](https://docs.volcengine.com/docs/6561/1594356?lang=zh#_4-3-外部rag输入)：**不能。**
+
+实时对话链路里，外部知识的官方入口是：
+
+1. **你的客户端**先查到知识  
+2. 用 **502 ChatRAGText** 把 `{ title, content }` 数组字符串发给豆包  
+3. 豆包再总结/口语化 → TTS  
+
+也就是：**检索在客户端，注入靠 502**。文档没有「豆包作为 MCP Client 去连知识库 Server」的能力。
+
+### 若知识库做成了 MCP Server，怎么实现同一效果？
+
+| 方案 | 能否实现「自然聊 + 轻量带词」 | 说明 |
+|------|------------------------------|------|
+| 当前：HTTP `/retrieve` → 502 | ✅ | 本设计已落地 |
+| MCP Server → **本端当 MCP Client 查完再发 502** | ✅ | 只换检索协议；**豆包侧仍走 502** |
+| 指望豆包实时会话**直接**调 MCP | ❌ | 当前 API 不支持 |
+
+可选流程（仅检索层换皮）：
+
+```text
+用户说完
+  → 前端/后端（可选：MCP Client）查知识库
+  → 仍发 ChatRAGText(502)
+  → 豆包口语化 + TTS → 数字人
+```
+
+对豆包而言，最终仍是同一份 `external_rag` 字符串。
+
+### 何时值得上 MCP
+
+- 知识库还要给 Cursor / 其他 Agent / 多客户端共用 → 做成 MCP 有价值  
+- **只服务本语音 POC** → 继续 HTTP `ragClient` 更简单，时延更好控（浏览器直连 8787，超时 300ms）  
+- 浏览器里直接挂 MCP（stdio）不现实，通常还要多一层后端当 MCP Client，反而多一跳  
+
+**结论（冻结）：** 知识库将来可做成 MCP，但实现本效果时 MCP 只能替掉检索侧；**注入豆包必须仍走 502**，不能把「实时语音链路通过 MCP 查库」当作官方能力。
 
 ---
 
