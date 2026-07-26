@@ -72,7 +72,7 @@
     │  ASREnded(459) ──────────────┐
     │                              ▼
     │                      [ragClient] 浅召回
-    │                      POST /retrieve  (timeout ≤2000ms)
+    │                      POST /retrieve  (timeout ≤500ms)
     │                              │
     │                     强相关？短卡片 1～2 条
     │                         ╱         ╲
@@ -89,16 +89,22 @@
 
 ## 7. Timing
 
-1. `ASRResponse(451)`：`is_interim === false` 时更新 `finalAsrText`；否则保留最新 interim 作兜底  
-2. `ASREnded(459)`：**立刻**用当前文本 retrieve；强相关则马上发 502  
+1. `ASRResponse(451)`：更新本轮文本，并**预取** `/retrieve`（与最终文本相同时复用）  
+2. `ASREnded(459)`：等待预取结果；强相关则马上发 502  
 3. 无可用文本 → skip RAG  
+
+**双回复问题：** 豆包不会把闲聊 TTS 与 `external_rag` TTS「融成一段」。本 POC 策略是：**一旦本轮要发 502，就不播闲聊**——
+
+1. `ASREnded` 后先 `hold`（丢弃决策窗内的数字人音频）  
+2. 有强相关：`ClientInterrupt(515)` + 发 502，`rag_only` 只放行 `tts_type=external_rag` 的 PCM  
+3. 无强相关：`pass`，正常闲聊  
 
 打断：
 
-- `ASRInfo(450)`：`AbortController` 取消 retrieve；清空本轮缓冲；`avatar.interrupt()`  
-- 用 `turnId`（或 `question_id`）丢弃过期 502，防止串轮  
+- `ASRInfo(450)`：`AbortController` 取消 retrieve；清空本轮缓冲；`avatar.interrupt()`；回复模式回 `pass`  
+- 用 `turnId` 丢弃过期 502，防止串轮  
 
-不做「先等闲聊 TTS，再补 502」——发晚了容易冲突或重来，反而增加体感时延。
+不做「闲聊播完再补 502」。
 
 ## 8. Recall policy（浅召回）
 
@@ -151,7 +157,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 
 结论：按本设计，**体感时延通常不会明显变长**。主要风险是超时设太长或 502 发太晚。
 
-超时默认 **2000ms**（本机 hybrid 冷启动曾测到 ~1s；热查询仍为 ms 级）：超时立即放弃 RAG，不阻塞闲聊通路。
+超时默认 **500ms**（热查询通常 ms～几十 ms；冷启动若 >500ms 则本轮 skip RAG 走闲聊，可按需调高 `VITE_RAG_TIMEOUT_MS`）：超时立即放弃 RAG，缩短 hold 窗。
 
 ## 11. Module changes
 
@@ -174,7 +180,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 | `VITE_RAG_ENABLED` | `true` | 总开关 |
 | `VITE_RAG_BASE_URL` | `http://127.0.0.1:8787` | 本机服务 |
 | `VITE_RAG_TOP_K` | `2` | 浅召回条数 |
-| `VITE_RAG_TIMEOUT_MS` | `2000` | 超时则回退闲聊；本地 hybrid 冷启动可能 >300ms |
+| `VITE_RAG_TIMEOUT_MS` | `500` | 超时则回退闲聊；优先短 hold，冷启动偶发 skip 可调高 |
 | `VITE_DOUBAO_MODEL` | `1.2.1.1` | O 版本 |
 | `VITE_DOUBAO_SPEAKER` | O 兼容音色（如 `zh_female_vv_jupiter_bigtts`） | 与 model 匹配 |
 
@@ -190,7 +196,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 | Risk | Mitigation |
 |------|------------|
 | 回复变课堂腔 | 短卡片 + GUIDE；top_k≤2 |
-| 502 发晚导致重生成/变慢 | ASREnded 后立刻 retrieve+502；timeout 宜覆盖冷启动（默认 2000ms） |
+| 502 发晚导致重生成/变慢 | ASR 预取 + 短超时 hold（默认 500ms）；有 502 则只播 external_rag |
 | 串轮 | turnId + abort |
 | 8787 未启动 | skip，通话继续 |
 | 时延体感变差 | 先查超时与 502 时机，而不是词库本身 |
@@ -258,7 +264,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 ### 何时值得上 MCP
 
 - 知识库还要给 Cursor / 其他 Agent / 多客户端共用 → 做成 MCP 有价值  
-- **只服务本语音 POC** → 继续 HTTP `ragClient` 更简单，时延更好控（浏览器直连 8787；热查询 ms 级，超时默认 2000ms 覆盖冷启动）  
+- **只服务本语音 POC** → 继续 HTTP `ragClient` 更简单，时延更好控（浏览器直连 8787；热查询 ms 级，超时默认 500ms）  
 - 浏览器里直接挂 MCP（stdio）不现实，通常还要多一层后端当 MCP Client，反而多一跳  
 
 **结论（冻结）：** 知识库将来可做成 MCP，但实现本效果时 MCP 只能替掉检索侧；**注入豆包必须仍走 502**，不能把「实时语音链路通过 MCP 查库」当作官方能力。

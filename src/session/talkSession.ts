@@ -2,7 +2,7 @@ import { FrameQueue } from '@/modules/audio/frameQueue'
 import { MicCapture } from '@/modules/audio/micCapture'
 import { DoubaoRealtimeClient } from '@/modules/doubao/realtimeClient'
 import { IflytekAvatar } from '@/modules/iflytek/avatar'
-import { retrieveForQuery } from '@/modules/rag/ragClient'
+import { retrieveForQuery, type RetrieveResult } from '@/modules/rag/ragClient'
 
 export type TalkState = 'idle' | 'starting' | 'talking' | 'stopping' | 'error'
 
@@ -10,6 +10,20 @@ export type TalkSessionCallbacks = {
   onState?: (state: TalkState) => void
   onError?: (message: string) => void
 }
+
+type RagJob = {
+  turnId: number
+  query: string
+  controller: AbortController
+  promise: Promise<RetrieveResult | null>
+}
+
+/**
+ * After ASR ends we briefly hold audio, then either:
+ * - rag_only: ChatRAGText(502) wins; free-chat PCM/TTS is dropped
+ * - pass: no strong RAG hit; normal free chat
+ */
+type ReplyMode = 'pass' | 'hold' | 'rag_only'
 
 /**
  * Orchestrates one free-talk call.
@@ -25,8 +39,9 @@ export class TalkSession {
   private audioPipeline: Promise<void> = Promise.resolve()
   private wrapper: HTMLElement | null = null
   private cb: TalkSessionCallbacks = {}
-  private ragAbort: AbortController | null = null
-  private activeRagTurnId = 0
+  private ragJob: RagJob | null = null
+  private replyMode: ReplyMode = 'pass'
+  private activeTtsType: string | undefined
 
   constructor(callbacks: TalkSessionCallbacks = {}) {
     this.cb = callbacks
@@ -58,12 +73,20 @@ export class TalkSession {
         onPcm: (pcm24k) => {
           this.enqueueAvatarOperation(() => this.onDoubaoPcm(pcm24k))
         },
+        onTtsStart: (info) => {
+          this.onTtsStart(info)
+        },
         onTtsEnd: () => {
           this.enqueueAvatarOperation(() => this.onTtsEnd())
         },
         onInterrupt: () => {
-          this.abortRagRetrieve()
+          this.abortRagJob()
+          this.replyMode = 'pass'
+          this.activeTtsType = undefined
           this.enqueueAvatarOperation(() => this.onInterrupt())
+        },
+        onAsrUpdate: (text, turnId) => {
+          this.startRagJob(text, turnId)
         },
         onAsrEnded: (text, turnId) => {
           void this.onAsrEnded(text, turnId)
@@ -85,38 +108,87 @@ export class TalkSession {
     }
   }
 
-  private abortRagRetrieve() {
-    this.ragAbort?.abort()
-    this.ragAbort = null
+  private abortRagJob() {
+    this.ragJob?.controller.abort()
+    this.ragJob = null
+  }
+
+  /** Prefetch / refresh retrieve while user is still speaking (ASR updates). */
+  private startRagJob(query: string, turnId: number) {
+    const q = query.trim()
+    if (!q || this.state !== 'talking') return
+    if (this.ragJob?.turnId === turnId && this.ragJob.query === q) return
+
+    this.ragJob?.controller.abort()
+    const controller = new AbortController()
+    const promise = retrieveForQuery(q, { signal: controller.signal })
+    this.ragJob = { turnId, query: q, controller, promise }
   }
 
   private async onAsrEnded(text: string, turnId: number) {
     if (this.state !== 'talking') return
-    this.abortRagRetrieve()
-    const controller = new AbortController()
-    this.ragAbort = controller
-    this.activeRagTurnId = turnId
+
+    // Hold avatar audio until we know whether this turn is RAG-only or free chat.
+    this.replyMode = 'hold'
+    this.activeTtsType = undefined
+    this.queue.clear()
+
+    this.startRagJob(text, turnId)
+    const job = this.ragJob
+    if (!job || job.turnId !== turnId) {
+      this.replyMode = 'pass'
+      return
+    }
 
     try {
-      const result = await retrieveForQuery(text, { signal: controller.signal })
-      if (controller.signal.aborted) return
+      const result = await job.promise
+      if (job.controller.signal.aborted) return
       if (this.state !== 'talking') return
-      if (turnId !== this.activeRagTurnId) return
-      if (!result?.externalRag) return
+      if (this.ragJob !== job) return
 
+      if (!result?.externalRag) {
+        this.replyMode = 'pass'
+        console.info('[rag] no strong hit — free chat')
+        return
+      }
+
+      // Policy: when 502 fires, do not play free-chat content — only external_rag TTS.
+      this.replyMode = 'rag_only'
+      this.doubao.clientInterrupt()
+      this.enqueueAvatarOperation(() => this.onInterrupt())
       this.doubao.sendChatRagText(result.externalRag, turnId)
+      console.info('[rag] ChatRAGText only (free chat suppressed)')
     } catch (e) {
-      // retrieveForQuery already swallows network errors; keep session alive.
+      this.replyMode = 'pass'
       console.warn('[rag] unexpected error', e)
     } finally {
-      if (this.ragAbort === controller) this.ragAbort = null
+      if (this.ragJob === job) this.ragJob = null
     }
+  }
+
+  private onTtsStart(info?: { ttsType?: string; text?: string }) {
+    this.activeTtsType = info?.ttsType
+    if (this.replyMode === 'hold') return
+    if (this.replyMode === 'rag_only' && info?.ttsType !== 'external_rag') {
+      // Stray free-chat sentence after we chose RAG — cut again, drop audio.
+      console.info('[rag] drop free-chat TTS while rag_only')
+      this.doubao.clientInterrupt()
+      this.enqueueAvatarOperation(() => this.onInterrupt())
+    }
+  }
+
+  private allowsAvatarAudio(): boolean {
+    if (this.replyMode === 'hold') return false
+    if (this.replyMode === 'rag_only') return this.activeTtsType === 'external_rag'
+    return true
   }
 
   private async onDoubaoPcm(pcm: Uint8Array) {
     if (this.state !== 'talking' || !this.avatar.isConnected()) return
+    if (!this.allowsAvatarAudio()) return
     for (const frame of this.queue.push(pcm)) {
       if (!this.avatar.isConnected()) return
+      if (!this.allowsAvatarAudio()) return
       await this.avatar.sendPcm(frame)
     }
   }
@@ -134,10 +206,19 @@ export class TalkSession {
   }
 
   private async onTtsEnd() {
+    if (!this.allowsAvatarAudio()) {
+      this.queue.clear()
+      if (this.replyMode === 'rag_only' && this.activeTtsType !== 'external_rag') return
+      if (this.replyMode === 'hold') return
+    }
     if (!this.avatar.isConnected()) return
     const remainder = this.queue.drain()
     if (remainder) await this.avatar.sendPcm(remainder)
     await this.avatar.endAudioStream()
+    if (this.replyMode === 'rag_only' && this.activeTtsType === 'external_rag') {
+      this.replyMode = 'pass'
+      this.activeTtsType = undefined
+    }
   }
 
   private async onInterrupt() {
@@ -160,7 +241,9 @@ export class TalkSession {
   }
 
   private async cleanup() {
-    this.abortRagRetrieve()
+    this.abortRagJob()
+    this.replyMode = 'pass'
+    this.activeTtsType = undefined
     this.queue.clear()
     this.mic.stop()
     // Stop avatar first so leftover Doubao PCM cannot writeAudio after teardown.

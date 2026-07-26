@@ -24,6 +24,8 @@ export const EVENT_FINISH_SESSION = 102
 export const EVENT_TASK_REQUEST = 200
 /** Inject external RAG knowledge after user query (≤4K chars JSON array string). */
 export const EVENT_CHAT_RAG_TEXT = 502
+/** Client barge-in / cancel current model speech generation. */
+export const EVENT_CLIENT_INTERRUPT = 515
 
 /** Server → client event IDs */
 export const EVENT_CONNECTION_STARTED = 50

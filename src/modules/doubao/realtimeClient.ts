@@ -5,6 +5,7 @@ import {
   EVENT_ASR_RESPONSE,
   EVENT_CHAT_RAG_TEXT,
   EVENT_CHAT_RESPONSE,
+  EVENT_CLIENT_INTERRUPT,
   EVENT_CONNECTION_STARTED,
   EVENT_FINISH_CONNECTION,
   EVENT_FINISH_SESSION,
@@ -26,6 +27,8 @@ export type RealtimeHandlers = {
   onTtsStart?: (info?: { ttsType?: string; text?: string }) => void
   onTtsEnd?: () => void
   onInterrupt?: () => void
+  /** ASR text updated mid-utterance — use to prefetch RAG before ASREnded. */
+  onAsrUpdate?: (text: string, turnId: number) => void
   /** Fired on ASREnded with best available transcript for this turn. */
   onAsrEnded?: (text: string, turnId: number) => void
   onError?: (err: Error) => void
@@ -57,6 +60,10 @@ export class AsrTranscriptBuffer {
     if (text) this.text = text
   }
 
+  peek(): string {
+    return this.text
+  }
+
   commit(): string {
     const text = this.text
     this.text = ''
@@ -76,6 +83,9 @@ export class DoubaoRealtimeClient {
   private asrTranscript = new AsrTranscriptBuffer()
   private pendingEventWaiters = new Map<number, Array<(frame: ParsedFrame) => void>>()
   private turnId = 0
+  /** Free-chat generation started this user turn (before optional RAG inject). */
+  private assistantStartedThisTurn = false
+  private assistantEndedThisTurn = false
 
   async connect(handlers: RealtimeHandlers = {}): Promise<void> {
     this.handlers = handlers
@@ -83,6 +93,7 @@ export class DoubaoRealtimeClient {
     this.sessionId = crypto.randomUUID().replace(/-/g, '')
     this.pendingEventWaiters.clear()
     this.asrTranscript.reset()
+    this.resetAssistantTurnFlags()
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const url = `${proto}://${location.host}/doubao-realtime`
@@ -135,7 +146,21 @@ export class DoubaoRealtimeClient {
     this.handlers.onStatus?.('SessionStarted')
   }
 
-  /** Wait until the server emits a specific event id (or reject on timeout/error). */
+  private resetAssistantTurnFlags() {
+    this.assistantStartedThisTurn = false
+    this.assistantEndedThisTurn = false
+  }
+
+  /** Whether free-chat already started this turn (race with late ChatRAGText). */
+  hasAssistantStartedThisTurn(): boolean {
+    return this.assistantStartedThisTurn
+  }
+
+  /** Whether the free-chat TTS already finished this turn. */
+  hasAssistantEndedThisTurn(): boolean {
+    return this.assistantEndedThisTurn
+  }
+
   private waitForServerEvent(eventId: number, timeoutMs: number): Promise<ParsedFrame> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -190,11 +215,14 @@ export class DoubaoRealtimeClient {
       if (frame.event === EVENT_ASR_INFO) {
         this.asrTranscript.reset()
         this.turnId += 1
+        this.resetAssistantTurnFlags()
         this.handlers.onInterrupt?.()
         return
       }
       if (frame.event === EVENT_ASR_RESPONSE) {
         this.asrTranscript.update(frame.payload)
+        const text = this.asrTranscript.peek().trim()
+        if (text) this.handlers.onAsrUpdate?.(text, this.turnId)
         return
       }
       if (frame.event === EVENT_ASR_ENDED) {
@@ -212,10 +240,13 @@ export class DoubaoRealtimeClient {
         const ttsType = typeof payload?.tts_type === 'string' ? payload.tts_type : undefined
         const text = typeof payload?.text === 'string' ? payload.text : undefined
         if (ttsType) console.info('[doubao] tts_type=', ttsType)
+        this.assistantStartedThisTurn = true
+        if (ttsType === 'external_rag') this.assistantEndedThisTurn = false
         this.handlers.onTtsStart?.({ ttsType, text })
         return
       }
       if (frame.event === EVENT_TTS_ENDED) {
+        this.assistantEndedThisTurn = true
         this.handlers.onTtsEnd?.()
         return
       }
@@ -231,6 +262,7 @@ export class DoubaoRealtimeClient {
               ? String((frame.payload as { content: unknown }).content ?? '')
               : ''
         if (text) {
+          this.assistantStartedThisTurn = true
           console.info('[doubao] chat:', text)
           this.handlers.onChatText?.(text)
         }
@@ -243,6 +275,14 @@ export class DoubaoRealtimeClient {
   sendAudio(pcm16k: Uint8Array): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     this.send(buildAudioTaskRequest(this.sessionId, pcm16k))
+  }
+
+  /** Cancel current model speech so a late ChatRAGText can become the only audible reply. */
+  clientInterrupt(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    console.info('[doubao] ClientInterrupt (515)')
+    this.send(buildFullClientEvent(EVENT_CLIENT_INTERRUPT, {}, this.sessionId))
+    this.assistantEndedThisTurn = false
   }
 
   /** Send ChatRAGText (502). `externalRag` must already be a JSON array string. */
@@ -269,6 +309,7 @@ export class DoubaoRealtimeClient {
     this.closed = true
     this.pendingEventWaiters.clear()
     this.asrTranscript.reset()
+    this.resetAssistantTurnFlags()
     const ws = this.ws
     this.ws = null
     if (!ws) return

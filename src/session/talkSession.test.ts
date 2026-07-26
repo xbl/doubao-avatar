@@ -2,8 +2,8 @@ import { expect, it, vi } from 'vitest'
 
 const doubles = vi.hoisted(() => {
   const avatarCalls: Array<{ type: string; bytes?: number[] }> = []
-  const ragCalls: Array<{ query: string; turnId: number }> = []
   const chatRagPayloads: string[] = []
+  const clientInterrupts: number[] = []
   let doubaoHandlers: Record<string, (...args: any[]) => void> = {}
   let retrieveImpl: (
     query: string,
@@ -12,8 +12,8 @@ const doubles = vi.hoisted(() => {
 
   return {
     avatarCalls,
-    ragCalls,
     chatRagPayloads,
+    clientInterrupts,
     getDoubaoHandlers: () => doubaoHandlers,
     setRetrieveImpl: (
       impl: (
@@ -32,9 +32,12 @@ const doubles = vi.hoisted(() => {
 
       sendAudio() {}
 
-      sendChatRagText(externalRag: string, turnId?: number) {
+      clientInterrupt() {
+        clientInterrupts.push(1)
+      }
+
+      sendChatRagText(externalRag: string) {
         chatRagPayloads.push(externalRag)
-        if (turnId !== undefined) ragCalls.push({ query: externalRag, turnId })
       }
 
       async close() {}
@@ -56,7 +59,9 @@ const doubles = vi.hoisted(() => {
         avatarCalls.push({ type: 'end' })
       }
 
-      async interrupt() {}
+      async interrupt() {
+        avatarCalls.push({ type: 'interrupt' })
+      }
 
       async stop() {}
     },
@@ -84,6 +89,9 @@ vi.mock('@/modules/rag/ragClient', () => ({
 import { TalkSession } from './talkSession'
 
 it('sends the queued PCM remainder before ending the avatar stream', async () => {
+  doubles.avatarCalls.length = 0
+  doubles.setRetrieveImpl(async () => null)
+
   const session = new TalkSession()
   await session.start({} as HTMLElement)
 
@@ -97,18 +105,56 @@ it('sends the queued PCM remainder before ending the avatar stream', async () =>
   ])
 })
 
-it('sends ChatRAGText after ASR ended when retrieve returns payload', async () => {
+it('on RAG hit: interrupt free chat, send 502, drop free PCM, play external_rag only', async () => {
   doubles.chatRagPayloads.length = 0
+  doubles.clientInterrupts.length = 0
+  doubles.avatarCalls.length = 0
   doubles.setRetrieveImpl(async () => ({
     externalRag: JSON.stringify([{ title: '谢谢', content: 'guide' }]),
   }))
 
   const session = new TalkSession()
   await session.start({} as HTMLElement)
-  doubles.getDoubaoHandlers().onAsrEnded('谢谢', 1)
+  const h = doubles.getDoubaoHandlers()
+
+  // Free chat tries to speak while we decide — must not reach avatar.
+  void h.onAsrEnded('谢谢', 1)
+  h.onTtsStart?.({ ttsType: undefined })
+  h.onPcm(new Uint8Array([9, 9]))
+  h.onTtsEnd()
 
   await vi.waitFor(() => expect(doubles.chatRagPayloads).toHaveLength(1))
-  expect(doubles.chatRagPayloads[0]).toContain('谢谢')
+  expect(doubles.clientInterrupts.length).toBeGreaterThanOrEqual(1)
+  expect(doubles.avatarCalls.some((c) => c.type === 'pcm' && c.bytes?.[0] === 9)).toBe(false)
+
+  // Only external_rag audio is forwarded (remainder drained on TTS end).
+  doubles.avatarCalls.length = 0
+  h.onTtsStart?.({ ttsType: 'external_rag' })
+  h.onPcm(new Uint8Array([1, 2, 3, 4]))
+  h.onTtsEnd()
+  await vi.waitFor(() =>
+    expect(doubles.avatarCalls.some((c) => c.type === 'pcm' && c.bytes?.[0] === 1)).toBe(true),
+  )
+})
+
+it('without RAG hit: free chat PCM still plays', async () => {
+  doubles.avatarCalls.length = 0
+  doubles.chatRagPayloads.length = 0
+  doubles.setRetrieveImpl(async () => null)
+
+  const session = new TalkSession()
+  await session.start({} as HTMLElement)
+  const h = doubles.getDoubaoHandlers()
+
+  await h.onAsrEnded('随便聊聊', 1)
+  await new Promise((r) => setTimeout(r, 10))
+
+  h.onPcm(new Uint8Array([5, 6]))
+  h.onTtsEnd()
+  await vi.waitFor(() =>
+    expect(doubles.avatarCalls.some((c) => c.type === 'pcm')).toBe(true),
+  )
+  expect(doubles.chatRagPayloads).toHaveLength(0)
 })
 
 it('does not send stale ChatRAGText after barge-in abort', async () => {
