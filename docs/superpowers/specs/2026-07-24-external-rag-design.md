@@ -72,7 +72,7 @@
     │  ASREnded(459) ──────────────┐
     │                              ▼
     │                      [ragClient] 浅召回
-    │                      POST /retrieve  (timeout ≤300ms)
+    │                      POST /retrieve  (timeout ≤2000ms)
     │                              │
     │                     强相关？短卡片 1～2 条
     │                         ╱         ╲
@@ -151,7 +151,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 
 结论：按本设计，**体感时延通常不会明显变长**。主要风险是超时设太长或 502 发太晚。
 
-超时默认 **300ms**：超时立即放弃 RAG，不阻塞闲聊通路。
+超时默认 **2000ms**（本机 hybrid 冷启动曾测到 ~1s；热查询仍为 ms 级）：超时立即放弃 RAG，不阻塞闲聊通路。
 
 ## 11. Module changes
 
@@ -174,7 +174,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 | `VITE_RAG_ENABLED` | `true` | 总开关 |
 | `VITE_RAG_BASE_URL` | `http://127.0.0.1:8787` | 本机服务 |
 | `VITE_RAG_TOP_K` | `2` | 浅召回条数 |
-| `VITE_RAG_TIMEOUT_MS` | `300` | 超时则回退闲聊 |
+| `VITE_RAG_TIMEOUT_MS` | `2000` | 超时则回退闲聊；本地 hybrid 冷启动可能 >300ms |
 | `VITE_DOUBAO_MODEL` | `1.2.1.1` | O 版本 |
 | `VITE_DOUBAO_SPEAKER` | O 兼容音色（如 `zh_female_vv_jupiter_bigtts`） | 与 model 匹配 |
 
@@ -190,7 +190,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 | Risk | Mitigation |
 |------|------------|
 | 回复变课堂腔 | 短卡片 + GUIDE；top_k≤2 |
-| 502 发晚导致重生成/变慢 | ASREnded 后立刻 retrieve+502；timeout 300ms |
+| 502 发晚导致重生成/变慢 | ASREnded 后立刻 retrieve+502；timeout 宜覆盖冷启动（默认 2000ms） |
 | 串轮 | turnId + abort |
 | 8787 未启动 | skip，通话继续 |
 | 时延体感变差 | 先查超时与 502 时机，而不是词库本身 |
@@ -258,7 +258,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 ### 何时值得上 MCP
 
 - 知识库还要给 Cursor / 其他 Agent / 多客户端共用 → 做成 MCP 有价值  
-- **只服务本语音 POC** → 继续 HTTP `ragClient` 更简单，时延更好控（浏览器直连 8787，超时 300ms）  
+- **只服务本语音 POC** → 继续 HTTP `ragClient` 更简单，时延更好控（浏览器直连 8787；热查询 ms 级，超时默认 2000ms 覆盖冷启动）  
 - 浏览器里直接挂 MCP（stdio）不现实，通常还要多一层后端当 MCP Client，反而多一跳  
 
 **结论（冻结）：** 知识库将来可做成 MCP，但实现本效果时 MCP 只能替掉检索侧；**注入豆包必须仍走 502**，不能把「实时语音链路通过 MCP 查库」当作官方能力。

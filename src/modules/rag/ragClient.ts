@@ -43,13 +43,13 @@ export function getRagConfig(): RagConfig {
       : !['0', 'false', 'off', 'no'].includes(String(enabledRaw).trim().toLowerCase())
 
   const topK = Number(import.meta.env.VITE_RAG_TOP_K || 2)
-  const timeoutMs = Number(import.meta.env.VITE_RAG_TIMEOUT_MS || 300)
+  const timeoutMs = Number(import.meta.env.VITE_RAG_TIMEOUT_MS || 2000)
 
   return {
     enabled,
     baseUrl: (import.meta.env.VITE_RAG_BASE_URL || 'http://127.0.0.1:8787').replace(/\/$/, ''),
     topK: Number.isFinite(topK) && topK > 0 ? Math.min(Math.floor(topK), 5) : 2,
-    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 300,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 2000,
   }
 }
 
