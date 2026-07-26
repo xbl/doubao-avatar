@@ -8,24 +8,28 @@ import {
   type RagHit,
 } from './ragClient'
 
+/** Mirrors local hybrid 8787 scale (score ~0–1+, score_keyword for lexical strength). */
 const sampleHits: RagHit[] = [
   {
     id: '1',
-    score: 100,
+    score: 1.01,
+    score_keyword: 108,
     title: '谢谢',
     text: '【词汇】谢谢（xièxie）。词性：动。释义：表示感谢。例句：谢谢你。'.repeat(3),
     metadata: { pinyin: 'xièxie' },
   },
   {
     id: '2',
-    score: 60,
+    score: 0.5,
+    score_keyword: 16,
     title: '不客气',
     text: '【词汇】不客气。例句：不客气。',
     metadata: { pinyin: 'bú kèqi' },
   },
   {
     id: '3',
-    score: 10,
+    score: 0.61,
+    score_keyword: 0,
     title: '噪声',
     text: '弱相关条目',
   },
@@ -39,18 +43,42 @@ describe('shorten', () => {
 })
 
 describe('filterStrongHits', () => {
-  it('keeps top hits above relative score threshold', () => {
+  it('keeps lexical hits by score_keyword when present', () => {
     const kept = filterStrongHits(sampleHits, 2)
     expect(kept.map((h) => h.title)).toEqual(['谢谢', '不客气'])
   })
 
-  it('drops weak noise below half of max score', () => {
+  it('drops vector-only noise with low keyword score', () => {
     const kept = filterStrongHits(sampleHits, 3)
     expect(kept.map((h) => h.title)).toEqual(['谢谢', '不客气'])
   })
 
-  it('skips entire round when max score is too low', () => {
-    expect(filterStrongHits([{ id: 'x', score: 3, title: 'x', text: 'x' }], 2)).toEqual([])
+  it('skips chatter when all keyword scores are weak', () => {
+    expect(
+      filterStrongHits(
+        [
+          { id: 'a', score: 0.61, score_keyword: 0, title: '高兴', text: 'x' },
+          { id: 'b', score: 0.6, score_keyword: 0, title: '很', text: 'x' },
+        ],
+        2,
+      ),
+    ).toEqual([])
+  })
+
+  it('falls back to hybrid score floor when keyword is absent', () => {
+    expect(
+      filterStrongHits(
+        [
+          { id: 'a', score: 1.01, title: '谢谢', text: 'x' },
+          { id: 'b', score: 0.4, title: '弱', text: 'x' },
+        ],
+        2,
+      ).map((h) => h.title),
+    ).toEqual(['谢谢'])
+  })
+
+  it('skips entire round when max hybrid score is too low (no keyword)', () => {
+    expect(filterStrongHits([{ id: 'x', score: 0.3, title: 'x', text: 'x' }], 2)).toEqual([])
   })
 
   it('returns empty for empty hits', () => {

@@ -1,6 +1,9 @@
 export type RagHit = {
   id?: string
   score: number
+  /** Present on local hybrid retrieve; strong lexical matches are typically ≫ 0. */
+  score_keyword?: number
+  score_vector?: number
   title: string
   text: string
   source_id?: string
@@ -23,9 +26,17 @@ export const EXTERNAL_RAG_GUIDE =
 
 const CARD_BODY_MAX = 120
 const PAYLOAD_CHAR_LIMIT = 3800
-/** Absolute floor: max score below this → skip whole turn (noise). */
-const MIN_MAX_SCORE = 8
-/** Keep hits at least this fraction of the best score. */
+/**
+ * Hybrid `score` on local 8787 is roughly 0–1(+).
+ * Absolute floor: max hybrid score below this → skip (noise / weak vector-only).
+ */
+const MIN_MAX_SCORE = 0.85
+/**
+ * When `score_keyword` is present, prefer it: exact/near-exact lexical hits
+ * (e.g. 谢谢≈34–108) vs vector-only chatter (哈哈哈≈0).
+ */
+const MIN_KEYWORD_SCORE = 15
+/** Keep hits at least this fraction of the best hybrid score (fallback path). */
 const RELATIVE_SCORE_RATIO = 0.5
 
 export type RagConfig = {
@@ -61,6 +72,17 @@ export function shorten(text: string, maxChars: number): string {
 
 export function filterStrongHits(hits: RagHit[], topK: number): RagHit[] {
   if (!hits.length) return []
+
+  const hasKeywordSignal = hits.some(
+    (h) => typeof h.score_keyword === 'number' && Number.isFinite(h.score_keyword),
+  )
+  if (hasKeywordSignal) {
+    const strong = hits
+      .filter((h) => (h.score_keyword ?? 0) >= MIN_KEYWORD_SCORE)
+      .sort((a, b) => (b.score_keyword ?? 0) - (a.score_keyword ?? 0) || b.score - a.score)
+    return strong.slice(0, topK)
+  }
+
   const sorted = [...hits].sort((a, b) => b.score - a.score)
   const maxScore = sorted[0]?.score ?? 0
   if (maxScore < MIN_MAX_SCORE) return []
