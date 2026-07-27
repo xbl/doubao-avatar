@@ -130,7 +130,7 @@
 
 ```ts
 const GUIDE =
-  '可在回复中自然用到下列材料；保持口语聊天，勿逐条讲解、勿变课堂。\n'
+  '回复格式必须仍遵守人设：先一句自然中文口头语开头，主体多用英文（夹少量简单中文词），方便英国初学者。可自然带入下列材料，勿逐条讲解、勿变课堂。\n'
 
 function toCard(hit: RagHit): { title: string; content: string } {
   const pinyin = hit.metadata?.pinyin ? `（${hit.metadata.pinyin}）` : ''
@@ -145,7 +145,7 @@ function toCard(hit: RagHit): { title: string; content: string } {
 // external_rag = JSON.stringify(items)
 ```
 
-模型侧期望听感：聊天里轻轻带词，而不是「今天学第 N 课」。
+模型侧期望听感：中文口头语开头 + 英文主体里轻轻带词，而不是整段中文课堂。
 
 ## 10. Latency expectation
 

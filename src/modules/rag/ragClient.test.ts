@@ -92,8 +92,9 @@ describe('toExternalRagItems / payload', () => {
     expect(items).toHaveLength(2)
     expect(items[0].title).toBe('谢谢')
     expect(items[0].content.startsWith(EXTERNAL_RAG_GUIDE)).toBe(true)
+    expect(EXTERNAL_RAG_GUIDE).toMatch(/英文/)
     expect(items[0].content).toContain('xièxie')
-    expect(items[0].content.length).toBeLessThan(200)
+    expect(items[0].content.length).toBeLessThan(280)
     expect(items[1].content.startsWith(EXTERNAL_RAG_GUIDE)).toBe(false)
   })
 

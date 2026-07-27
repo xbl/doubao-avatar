@@ -22,7 +22,7 @@ export type ExternalRagItem = {
 }
 
 export const EXTERNAL_RAG_GUIDE =
-  '可在回复中自然用到下列材料；保持口语聊天，勿逐条讲解、勿变课堂。\n'
+  '回复格式必须仍遵守人设：先一句自然中文口头语开头，主体多用英文（夹少量简单中文词），方便英国初学者。可自然带入下列材料，勿逐条讲解、勿变课堂。\n'
 
 const CARD_BODY_MAX = 120
 const PAYLOAD_CHAR_LIMIT = 3800
